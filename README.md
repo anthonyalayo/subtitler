@@ -1,3 +1,11 @@
+# Modifications From Fork
+
+- This fork uses faster whisper to take advantage of VAD (voice activity detection).
+- Setup venv with `python -m venv venv` and `.\venv\Scripts\activate`
+- Run `pip install faster-whisper logging silero-vad` for extra dependencies
+- Launch with `.\venv\Scripts\subtitler`
+- Note this currently crashes on exit due to https://github.com/SYSTRAN/faster-whisper/issues/71
+
 # Table of Contents
 
 * [Subtitler](#subtitler)
