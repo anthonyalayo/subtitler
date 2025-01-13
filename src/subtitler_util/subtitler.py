@@ -42,6 +42,17 @@ def gen_wav_file(vid_file: str, file_map: dict):
     print(f"generated wav file for {vid_file} in {TEMP_DIR}")
     return output_audio_file
 
+
+def get_lang_iso_code(lang):
+    if len(lang) == 2:
+        # if already in ISO format just return
+        return lang
+    elif lang in TRANSCRIPTION_SUPPORTED_LANGS:
+        return TRANSCRIPTION_SUPPORTED_LANGS[lang]
+    elif lang in TRANSLATION_SUPPORTED_LANGS:
+        return TRANSLATION_SUPPORTED_LANGS[lang]
+
+
 def cleanup():
     for f in os.listdir(TEMP_DIR):
         os.remove(TEMP_DIR+DIR_DELIM+f)
@@ -107,7 +118,7 @@ def transcribe_audio(model: WhisperModel, audio_file: str, language: str):
             raise Exception("Cannot Transcribe! Unsupported Language. See Readme for list of supported languages.")
 
     vad_options = {'threshold': 0.20, 'min_silence_duration_ms': 3000, 'speech_pad_ms': 900}
-    segments, info = model.transcribe(audio_file, language=language, vad_filter=True, vad_parameters=vad_options)
+    segments, info = model.transcribe(audio_file, language=get_lang_iso_code(language), vad_filter=True, vad_parameters=vad_options)
     print(f"Transcription info: {info}")
     return [post_process_result_for_srt(segments), info.language]
 
@@ -151,15 +162,6 @@ def translate_transcribed_result(transcribed_result, transcribed_language, targe
     return translated_result
 
 def save_result_as_srt(result: dict, target_language: str, video_file_name: str, default_srt_file: bool=False):
-    def get_lang_iso_code(lang):
-        if len(lang) == 2:
-            # if already in ISO format just return
-            return lang
-        elif lang in TRANSCRIPTION_SUPPORTED_LANGS:
-            return TRANSCRIPTION_SUPPORTED_LANGS[lang]
-        elif lang in TRANSLATION_SUPPORTED_LANGS:
-            return TRANSLATION_SUPPORTED_LANGS[lang]
-
     target_language = target_language.lower()
     if default_srt_file:
         srt_file_name = ".".join(video_file_name.split(".")[:-1])+".default."+get_lang_iso_code(target_language)+".srt"
@@ -214,8 +216,12 @@ def subtitle(vid_file_map: dict, audio_files: list, video_language: str, transla
     total_steps += (len(audio_files)*2) + (len(audio_files)*len(translation_languages)*2)
     print_and_update_progress()
     for audio_file in audio_files:
+        [r, predicted_language] = transcribe_audio(model, audio_file, video_language)
+
         # overwriting language from what was determined during transcription if not set
-        [r, video_language] = transcribe_audio(model, audio_file, video_language)
+        if not video_language:
+            video_language = predicted_language
+
         print(f"Transcribed video: {vid_file_map[audio_file]} in {video_language}")
         print("Done.\nSaving...")
         print_and_update_progress(update_progress=True)
