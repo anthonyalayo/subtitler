@@ -1,11 +1,14 @@
 import ffmpeg
 import torch
 import os
-import whisper
 import deep_translator
 import argparse
 import sys
 import signal
+import logging
+from typing import Iterable
+from faster_whisper import WhisperModel
+from faster_whisper.transcribe import Segment
 from gooey import Gooey, GooeyParser
 from datetime import datetime, timedelta
 try:
@@ -34,7 +37,7 @@ def gen_wav_file(vid_file: str, file_map: dict):
     file_map[output_audio_file] = vid_file
     os.makedirs(TEMP_DIR,mode=0o777, exist_ok=True)
     input_stream = ffmpeg.input(vid_file)
-    output_stream = ffmpeg.output(input_stream.audio,output_audio_file,acodec="pcm_s16le",ar="44100",ac="2")
+    output_stream = ffmpeg.output(input_stream['a:0'],output_audio_file,acodec="pcm_s16le",ar="44100",ac="2")
     output_stream.run(overwrite_output=True, quiet=True)
     print(f"generated wav file for {vid_file} in {TEMP_DIR}")
     return output_audio_file
@@ -54,16 +57,21 @@ def init_model():
     def save_model_pref():
         with open(".model_pref","w") as f:
             f.write(model_size)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    device = 'cuda'
+    # device = torch.device(device)
+    if not torch.cuda.is_available():
+        print('missing cuda, exiting')
+        exit(1)
+
     if load_model_pref() is not None:
         print(f"loading whisper's '{load_model_pref()}' model")
-        return whisper.load_model(load_model_pref(),device=device)
+        return WhisperModel(load_model_pref(),device=device)
     else:
         model_sizes = ["large-v3","large-v2","large","medium","small","base","tiny"]
         for model_size in model_sizes:
             try:
-                model = whisper.load_model(model_size,device=device)
+                model = WhisperModel(model_size,device=device)
                 print(f"model {model_size} loaded successfully.")
                 save_model_pref()
                 return model
@@ -74,37 +82,34 @@ def init_model():
                 print(e)
         return None
 
-def detect_lang(model: whisper.model, audio_file: str):
-    audio = whisper.load_audio(audio_file)
-    audio = whisper.pad_or_trim(audio)
-    spectrogram = whisper.log_mel_spectrogram(audio).to(model.device)
-    _, p = model.detect_language(spectrogram)
-    return max(p, key=p.get)
+def transcribe_audio(model: WhisperModel, audio_file: str, language: str):
 
-def transcribe_audio(model: whisper.model, audio_file: str, language: str):
-    
     def format_timestamp(time_in_seconds):
         dt_obj = datetime.strptime("00:00:00.000", '%H:%M:%S.%f')
         delta_seconds = timedelta(seconds=time_in_seconds)
         dt_obj += delta_seconds
         return dt_obj.strftime("%H:%M:%S,%f")[:-3]
-    
-    def post_process_result_for_srt(result):
+
+    def post_process_result_for_srt(segments: Iterable[Segment]):
         new_result = {}
-        for seg in result["segments"]:
-            seg_id = seg["id"] + 1
+        for seg in segments:
+            seg_id = seg.id + 1
             new_result[seg_id] = {}
-            new_result[seg_id]["start_time"] = format_timestamp(seg["start"])
-            new_result[seg_id]["end_time"] = format_timestamp(seg["end"])
-            new_result[seg_id]["text"] = seg["text"].strip()
+            new_result[seg_id]["start_time"] = format_timestamp(seg.start)
+            new_result[seg_id]["end_time"] = format_timestamp(seg.end)
+            new_result[seg_id]["text"] = seg.text.strip()
+            print(f"[{seg.start} --> {seg.end}] {seg.text}")
         return new_result
-    
-    language = language.lower()
-    if language not in TRANSCRIPTION_SUPPORTED_LANGS:
-        raise Exception("Cannot Transcribe! Unsupported Language. See Readme for list of supported languages.")
-    audio= whisper.load_audio(audio_file)
-    result = model.transcribe(audio,language=language,task="transcribe")
-    return post_process_result_for_srt(result)
+
+    if language:
+        language = language.lower()
+        if language not in TRANSCRIPTION_SUPPORTED_LANGS:
+            raise Exception("Cannot Transcribe! Unsupported Language. See Readme for list of supported languages.")
+
+    vad_options = {'threshold': 0.20, 'min_silence_duration_ms': 3000, 'speech_pad_ms': 900}
+    segments, info = model.transcribe(audio_file, language=language, vad_filter=True, vad_parameters=vad_options)
+    print(f"Transcription info: {info}")
+    return [post_process_result_for_srt(segments), info.language]
 
 def translate_transcribed_result(transcribed_result, transcribed_language, target_language,translator="google", api_key=None):
 
@@ -146,13 +151,15 @@ def translate_transcribed_result(transcribed_result, transcribed_language, targe
     return translated_result
 
 def save_result_as_srt(result: dict, target_language: str, video_file_name: str, default_srt_file: bool=False):
-
     def get_lang_iso_code(lang):
-        if lang in TRANSCRIPTION_SUPPORTED_LANGS:
+        if len(lang) == 2:
+            # if already in ISO format just return
+            return lang
+        elif lang in TRANSCRIPTION_SUPPORTED_LANGS:
             return TRANSCRIPTION_SUPPORTED_LANGS[lang]
         elif lang in TRANSLATION_SUPPORTED_LANGS:
             return TRANSLATION_SUPPORTED_LANGS[lang]
-    
+
     target_language = target_language.lower()
     if default_srt_file:
         srt_file_name = ".".join(video_file_name.split(".")[:-1])+".default."+get_lang_iso_code(target_language)+".srt"
@@ -162,10 +169,7 @@ def save_result_as_srt(result: dict, target_language: str, video_file_name: str,
         for id, result_obj in result.items():
             f.write(str(id)+"\n")
             f.write(str(result_obj["start_time"])+" --> "+str(result_obj["end_time"])+"\n")
-            if os.name == 'nt':
-                f.write(result_obj["text"].encode('cp850','replace').decode('cp850'))
-            else:
-                f.write(result_obj["text"])
+            f.write(result_obj["text"])
             f.write("\n\n")
     return srt_file_name
 
@@ -199,15 +203,20 @@ def subtitle(vid_file_map: dict, audio_files: list, video_language: str, transla
 
     total_steps = 2
     current_step = 1
+
+    logging.basicConfig()
+    logging.getLogger("faster_whisper").setLevel(logging.INFO)
+
     print_and_update_progress()
     model = init_model()
     print_and_update_progress(update_progress=True)
     print("Done.")
     total_steps += (len(audio_files)*2) + (len(audio_files)*len(translation_languages)*2)
     print_and_update_progress()
-    for  audio_file in audio_files:
-        print(f"Transcribing video: {vid_file_map[audio_file]} in {video_language}")
-        r=transcribe_audio(model, audio_file, video_language)
+    for audio_file in audio_files:
+        # overwriting language from what was determined during transcription if not set
+        [r, video_language] = transcribe_audio(model, audio_file, video_language)
+        print(f"Transcribed video: {vid_file_map[audio_file]} in {video_language}")
         print("Done.\nSaving...")
         print_and_update_progress(update_progress=True)
         saved_file = save_result_as_srt(r,video_language,vid_file_map[audio_file],True)
@@ -221,6 +230,8 @@ def subtitle(vid_file_map: dict, audio_files: list, video_language: str, transla
             saved_file = save_result_as_srt(r2,translation_lang,vid_file_map[audio_file])
             print(f"\tDone. Saved translated result as srt file: {saved_file}")
             print_and_update_progress(update_progress=True)
+
+    cleanup()
         
 
 def process_args(args):
@@ -235,7 +246,6 @@ def process_args(args):
         for f in [f for f in args.video_files if check_if_file_is_video(f)]:
             audio_files.append(gen_wav_file(f,vid_file_map))
     subtitle(vid_file_map,audio_files,args.video_language,args.translation_languages, translation_service=args.translation_service, translation_service_api_key=args.translation_service_api_key, mode=args.mode)
-    cleanup()
 
 def cli():
     parser = argparse.ArgumentParser(description="Transcribe and Translate subtitles for videos in any language.",prog="Subtitler", epilog="Subtitler Copyright (C) 2024 Anupam Kumar <https://anupamkumar.me>. \nThis program comes with ABSOLUTELY NO WARRANTY.\nThis is free software, and you are welcome to redistribute it under certain conditions; \nGoto https://raw.githubusercontent.com/anupamkumar/subtitler/master/LICENSE for details.")
@@ -271,7 +281,7 @@ def gui():
     ip_files_group.add_argument("--video_files", help="full path to the video file you want to generate subtitles for",widget='MultiFileChooser', nargs="+")
     ip_files_group.add_argument("--video_dir", help="full path to directory where your video files may be",widget='DirChooser')
     transcribe_group = parser.add_argument_group("Transcription Configuration")
-    transcribe_group.add_argument("--video_language",help="Provide the language of the video(s). Set it to 'unknown' if you don't know and want AI to guess the language.(WARNING! This may be a bad-idea because the AI may make a mistake with language detection)",widget="FilterableDropdown",choices=TRANSCRIPTION_SUPPORTED_LANGS.keys(), required=True)
+    transcribe_group.add_argument("--video_language",help="Provide the language of the video(s). Set it to 'unknown' if you don't know and want AI to guess the language.(WARNING! This may be a bad-idea because the AI may make a mistake with language detection)",widget="FilterableDropdown",choices=TRANSCRIPTION_SUPPORTED_LANGS.keys(), required=False)
     transcribe_group.add_argument("--force_language_autodetect",help="force language detection for all videos even if you provide 'video language' parameter", widget="BlockCheckbox", action="store_true")
     translation_group = parser.add_argument_group("Translation Configuration")
     translation_group.add_argument("--translation_languages",help="select all the languages you want to also translate the subtitles to.",widget="Listbox",choices=TRANSLATION_SUPPORTED_LANGS.keys(), nargs="*", gooey_options={'height':200})
